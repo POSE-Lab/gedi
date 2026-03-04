@@ -259,8 +259,9 @@ class GeDi:
         device = pts.device
 
         # --- radius search ---
-        # row: indices into pcd
-        # col: indices into pts
+        # torch_cluster.radius(x=pcd, y=pts) returns:
+        # row: indices into y (pts)
+        # col: indices into x (pcd)
         row, col = radius(
             x=pcd,
             y=pts,
@@ -272,7 +273,11 @@ class GeDi:
         K = pts.shape[0]
         neighbors = [[] for _ in range(K)]
 
-        for p_idx, k_idx in zip(row.tolist(), col.tolist()):
+        if row.numel() > 0:
+            assert int(row.max()) < K
+            assert int(col.max()) < pcd.shape[0]
+
+        for k_idx, p_idx in zip(row.tolist(), col.tolist()):
             neighbors[k_idx].append(p_idx)
 
         pcd_desc = np.empty((K, self.dim), dtype=np.float32)
