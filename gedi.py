@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchgeometry as tgm
 import numpy as np
-from torch_cluster import radius
+import open3d.ml.torch as ml3d
 from backbones.pointnet2_ops_lib.pointnet2_ops.pointnet2_modules import PointnetSAModule
 
 
@@ -158,47 +158,42 @@ class LRF(nn.Module):
         self.r_lrf = r_lrf
         self.patches_per_pair = patches_per_pair
         self.samples_per_patch = samples_per_patch
+        self.device = device
 
     def _forward(self, xp, xpi):
 
-        assert xp.is_cuda
-        assert xpi.is_cuda
-
-        device = xp.device
-        dtype = xp.dtype
-
-        B, C, N = xpi.size()
-        assert C == 3, "Expected 3D points"
-
+        B, N, c = xpi.size()
         xpi = xpi.contiguous()  # dim = B x 3 x N
         xp = xp.unsqueeze(2).contiguous()  # dim = B x 3 x 1
 
         # zp
         x = xp - xpi  # pi->p = p - pi
-        xxt = torch.bmm(x, x.transpose(1, 2)) / N
+        xxt = torch.bmm(x, x.transpose(1, 2)) / c
 
-        _, _, v = torch.linalg.svd(xxt)
+        _, _, v = torch.svd(xxt.to(self.device))
+        v = v.to(self.device)
 
         with torch.no_grad():
             sum_ = (v[..., -1].unsqueeze(1) @ x).sum(2)
-            sign = torch.ones((B, 1), device=device, dtype=dtype)
-            sign = sign - 2 * (sum_ < 0)
+            _sign = torch.ones((len(xpi), 1), device=self.device) - 2 * (sum_ < 0)
 
-        zp = (sign * v[..., -1]).unsqueeze(1)  # B x 1 x 3
+        zp = (_sign * v[..., -1]).unsqueeze(1)  # B x 1 x 3
 
         # xp
-        x = -x  # p->pi = pi - p
+        x *= -1  # p->pi = pi - p
         norm = (zp @ x).transpose(1, 2)
         proj = norm * zp
+
         vi = x - proj.transpose(1, 2)
 
         x_l2 = torch.sqrt((x**2).sum(dim=1, keepdim=True))
-        alpha = (self.r_lrf - x_l2).clamp(min=0)
+
+        alpha = self.r_lrf - x_l2
         alpha = alpha * alpha
         beta = (norm * norm).transpose(1, 2)
-
         vi_c = (alpha * beta * vi).sum(2)
-        xp = vi_c / (vi_c.norm(dim=1, keepdim=True) + 1e-8)
+
+        xp = vi_c / torch.sqrt((vi_c**2).sum(1, keepdim=True))
 
         # yp
         yp = torch.cross(xp, zp.squeeze(), dim=1)
@@ -251,84 +246,63 @@ class GeDi:
         self.gedi_net.cuda().eval()
 
     def compute(self, pts, pcd):
-        """
-        pts: [K, 3] torch.Tensor (keypoints)
-        pcd: [N, 3] torch.Tensor (point cloud)
-        """
 
-        device = pts.device
+        # Open3D-ML MultiRadiusSearch in this setup supports CPU only.
+        pts_cpu = pts.detach().cpu()
+        pcd_cpu = pcd.detach().cpu()
+        radii = self.r_lrf * torch.ones((len(pts_cpu)), device=pts_cpu.device)
 
-        # --- radius search ---
-        # torch_cluster.radius(x=pcd, y=pts) returns:
-        # row: indices into y (pts)
-        # col: indices into x (pcd)
-        row, col = radius(
-            x=pcd,
-            y=pts,
-            r=self.r_lrf,
-            max_num_neighbors=self.samples_per_patch_lrf,
+        out = ml3d.ops.radius_search(
+            pcd_cpu,
+            pts_cpu,
+            radii,
+            points_row_splits=torch.LongTensor([0, len(pcd_cpu)]),
+            queries_row_splits=torch.LongTensor([0, len(pts_cpu)]),
         )
 
-        # Build neighbor lists per keypoint
-        K = pts.shape[0]
-        neighbors = [[] for _ in range(K)]
+        pcd_desc = np.empty((len(pts_cpu), self.dim), dtype=np.float32)
 
-        if row.numel() > 0:
-            assert int(row.max()) < K
-            assert int(col.max()) < pcd.shape[0]
+        for b in range(int(np.ceil(len(pts_cpu) / self.samples_per_batch))):
 
-        for k_idx, p_idx in zip(row.tolist(), col.tolist()):
-            neighbors[k_idx].append(p_idx)
-
-        pcd_desc = np.empty((K, self.dim), dtype=np.float32)
-
-        # --- batching ---
-        for b in range(int(np.ceil(K / self.samples_per_batch))):
             i_start = b * self.samples_per_batch
-            i_end = min((b + 1) * self.samples_per_batch, K)
+            i_end = (b + 1) * self.samples_per_batch
+            if i_end > len(pts_cpu):
+                i_end = len(pts_cpu)
 
             x = np.empty(
                 (i_end - i_start, 3, self.samples_per_patch_lrf),
                 dtype=np.float32,
             )
 
-            for j, i in enumerate(range(i_start, i_end)):
-                inds = neighbors[i]
+            j = 0
+            for i in range(i_start, i_end):
 
-                if len(inds) == 0:
-                    # Extremely rare, but be safe
-                    inds = np.random.choice(len(pcd), self.samples_per_patch_lrf)
-
-                elif len(inds) >= self.samples_per_patch_lrf:
+                _inds = out[0][out[1][i] : out[1][i + 1]]
+                try:
                     inds = np.random.choice(
-                        inds,
-                        size=self.samples_per_patch_lrf,
-                        replace=False,
+                        _inds.numpy(), size=self.samples_per_patch_lrf, replace=False
                     )
-                else:
-                    # Pad with repeats
-                    inds = np.concatenate(
-                        [
-                            inds,
-                            np.random.choice(
-                                inds,
-                                self.samples_per_patch_lrf - len(inds),
-                            ),
-                        ]
-                    )
+                except:
+                    # print('[w] got patch with few points -> {}. Padding with replicas ...'.format(len(pt_nn)))
+                    inds = np.r_[
+                        _inds,
+                        np.random.choice(
+                            _inds.numpy(), self.samples_per_patch_lrf - len(_inds)
+                        ),
+                    ]
 
-                x[j] = pcd[inds].T.cpu().numpy()
+                x[j] = pcd_cpu[inds].T
 
-            x = torch.from_numpy(x).to(device)
+                j += 1
 
-            pts_batch = pts[i_start:i_end].to(x.device)
-            assert x.device == pts_batch.device
-            patch = self.lrf(pts_batch, x)
+            x = torch.from_numpy(x)
+
+            patch = self.lrf(pts_cpu[i_start:i_end], x)
 
             with torch.no_grad():
-                f = self.gedi_net(patch)
+                f = self.gedi_net(patch.cuda())
 
-            pcd_desc[i_start:i_end] = f.cpu().numpy()
+            pcd_desc[i_start:i_end] = f.cpu().detach().numpy()[: i_end - i_start]
 
         return pcd_desc
 
