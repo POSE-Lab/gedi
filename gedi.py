@@ -1,3 +1,4 @@
+import argparse
 import numpy as np
 import open3d.ml.torch as ml3d
 import torch
@@ -231,7 +232,8 @@ class GeDi:
                        device='cpu')
 
         self.gedi_net = PointNet2Feature(dim=self.dim)
-        self.gedi_net.load_state_dict(torch.load(config['fchkpt_gedi_net'])['pnet_model_state_dict'])
+        torch.serialization.add_safe_globals([argparse.Namespace])
+        self.gedi_net.load_state_dict(torch.load(config['fchkpt_gedi_net'], weights_only=False)['pnet_model_state_dict'])
         self.gedi_net.cuda().eval()
 
     def compute(self, pts, pcd):
@@ -271,7 +273,10 @@ class GeDi:
             i_start = b * self.samples_per_batch
             i_end = min((b + 1) * self.samples_per_batch, K)
 
-            x = np.empty((i_end - i_start, 3, self.samples_per_patch_lrf))
+            x = np.empty(
+                (i_end - i_start, 3, self.samples_per_patch_lrf),
+                dtype=np.float32,
+            )
 
             for j, i in enumerate(range(i_start, i_end)):
                 inds = neighbors[i]
@@ -300,9 +305,9 @@ class GeDi:
 
                 x[j] = pcd[inds].T.cpu().numpy()
 
-            x = torch.from_numpy(x).to(device)
+            x = torch.from_numpy(x).to(device=device, dtype=torch.float32)
 
-            pts_batch = pts[i_start:i_end].to(x.device)
+            pts_batch = pts[i_start:i_end].to(device=x.device, dtype=torch.float32)
             assert x.device == pts_batch.device
             patch = self.lrf(pts_batch, x)
 
