@@ -280,30 +280,43 @@ class GeDi:
 
             for j, i in enumerate(range(i_start, i_end)):
                 inds = neighbors[i]
+                inds_np = np.asarray(inds, dtype=np.int64)
+                pcd_size = int(len(pcd))
 
-                if len(inds) == 0:
-                    # Extremely rare, but be safe
-                    inds = np.random.choice(len(pcd), self.samples_per_patch_lrf)
-
-                elif len(inds) >= self.samples_per_patch_lrf:
-                    inds = np.random.choice(
-                        inds,
-                        size=self.samples_per_patch_lrf,
-                        replace=False,
-                    )
-                else:
-                    # Pad with repeats
-                    inds = np.concatenate(
-                        [
-                            inds,
-                            np.random.choice(
-                                inds,
-                                self.samples_per_patch_lrf - len(inds),
-                            ),
+                if inds_np.size == 0:
+                    # Extremely rare, but be safe.
+                    if pcd_size <= 0:
+                        raise ValueError(
+                            "Empty point cloud passed to GeDi.compute; "
+                            "cannot sample LRF neighborhoods."
+                        )
+                    if pcd_size >= self.samples_per_patch_lrf:
+                        inds_np = np.linspace(
+                            0,
+                            pcd_size - 1,
+                            self.samples_per_patch_lrf,
+                            dtype=np.int64,
+                        )
+                    else:
+                        reps = int(np.ceil(self.samples_per_patch_lrf / pcd_size))
+                        inds_np = np.tile(np.arange(pcd_size, dtype=np.int64), reps)[
+                            : self.samples_per_patch_lrf
                         ]
-                    )
 
-                x[j] = pcd[inds].T.cpu().numpy()
+                elif inds_np.size >= self.samples_per_patch_lrf:
+                    sel = np.linspace(
+                        0,
+                        inds_np.size - 1,
+                        self.samples_per_patch_lrf,
+                        dtype=np.int64,
+                    )
+                    inds_np = inds_np[sel]
+                else:
+                    # Pad deterministically with repeats.
+                    reps = int(np.ceil(self.samples_per_patch_lrf / inds_np.size))
+                    inds_np = np.tile(inds_np, reps)[: self.samples_per_patch_lrf]
+
+                x[j] = pcd[inds_np].T.cpu().numpy()
 
             x = torch.from_numpy(x).to(device=device, dtype=torch.float32)
 
