@@ -1,6 +1,5 @@
 import argparse
 import numpy as np
-import open3d.ml.torch as ml3d
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
