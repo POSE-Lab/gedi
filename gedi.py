@@ -244,12 +244,17 @@ class GeDi:
         device = pts.device
 
         # --- radius search ---
+        # Some torch_cluster builds are CPU-only. Run neighbor search on CPU
+        # tensors and keep descriptor extraction on the original device.
+        pts_cpu = pts.detach().cpu()
+        pcd_cpu = pcd.detach().cpu()
+
         # torch_cluster.radius(x=pcd, y=pts) returns:
         # row: indices into y (pts)
         # col: indices into x (pcd)
         row, col = radius(
-            x=pcd,
-            y=pts,
+            x=pcd_cpu,
+            y=pts_cpu,
             r=self.r_lrf,
             max_num_neighbors=self.samples_per_patch_lrf,
         )
