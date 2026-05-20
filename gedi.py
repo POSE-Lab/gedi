@@ -191,7 +191,8 @@ class LRF(nn.Module):
         xp = vi_c / (vi_c.norm(dim=1, keepdim=True) + 1e-8)
 
         # yp
-        yp = torch.cross(xp, zp.squeeze(), dim=1)
+        # Keep batch dimension even when B==1.
+        yp = torch.cross(xp, zp.squeeze(1), dim=1)
 
         lrf = torch.cat((xp.unsqueeze(2), yp.unsqueeze(2), zp.transpose(1, 2)), dim=2)
 
