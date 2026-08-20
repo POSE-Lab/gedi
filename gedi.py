@@ -260,17 +260,84 @@ class GeDi:
             max_num_neighbors=self.samples_per_patch_lrf,
         )
 
-        # Build neighbor lists per keypoint
         K = pts.shape[0]
-        neighbors = [[] for _ in range(K)]
+        pcd_size = int(pcd.shape[0])
+        S = self.samples_per_patch_lrf  # target neighbor count per keypoint
 
         if row.numel() > 0:
             assert int(row.max()) < K
-            assert int(col.max()) < pcd.shape[0]
+            assert int(col.max()) < pcd_size
 
-        for k_idx, p_idx in zip(row.tolist(), col.tolist()):
-            neighbors[k_idx].append(p_idx)
+        # --- Vectorized neighbor index construction ---
+        # Build a [K, S] padded neighbor index tensor directly using scatter,
+        # replacing the pure-Python for-loop that iterated ~250k times.
+        # Count neighbors per keypoint
+        counts = torch.zeros(K, dtype=torch.long)
+        if row.numel() > 0:
+            counts.scatter_add_(0, row, torch.ones_like(row))
 
+        # Pre-allocate padded neighbor tensor with a sentinel (0)
+        padded_neighbors = torch.zeros(K, S, dtype=torch.long)
+
+        if row.numel() > 0:
+            # Build per-keypoint local offsets using cumsum within each group
+            offsets = torch.zeros_like(row)
+            # For each keypoint group, compute the position within that group
+            sorted_order = torch.argsort(row, stable=True)
+            sorted_row = row[sorted_order]
+            sorted_col = col[sorted_order]
+            # Compute within-group indices
+            group_starts = torch.zeros(K + 1, dtype=torch.long)
+            group_starts[1:] = counts.cumsum(0)
+            flat_positions = torch.arange(row.numel()) - group_starts[sorted_row]
+            # Only keep neighbors that fit within S slots
+            valid = flat_positions < S
+            valid_positions = flat_positions[valid]
+            valid_row = sorted_row[valid]
+            valid_col = sorted_col[valid]
+            padded_neighbors[valid_row, valid_positions] = valid_col
+
+        # Now handle padding/subsampling per keypoint
+        # For keypoints with 0 neighbors: use linspace/tile fallback from full PCD
+        # For keypoints with > S neighbors: already capped by max_num_neighbors
+        # For keypoints with < S neighbors: tile existing neighbors
+        needs_fallback = counts == 0
+        needs_padding = (counts > 0) & (counts < S)
+
+        if needs_fallback.any():
+            if pcd_size <= 0:
+                raise ValueError(
+                    "Empty point cloud passed to GeDi.compute; "
+                    "cannot sample LRF neighborhoods."
+                )
+            if pcd_size >= S:
+                fallback_inds = torch.linspace(
+                    0, pcd_size - 1, S, dtype=torch.float32
+                ).round().long()
+            else:
+                reps = int(np.ceil(S / pcd_size))
+                fallback_inds = torch.arange(pcd_size).repeat(reps)[:S]
+            padded_neighbors[needs_fallback] = fallback_inds.unsqueeze(0)
+
+        if needs_padding.any():
+            pad_indices = torch.nonzero(needs_padding, as_tuple=False).flatten()
+            for idx in pad_indices.tolist():
+                c = int(counts[idx].item())
+                existing = padded_neighbors[idx, :c]
+                reps = int(np.ceil(S / c))
+                tiled = existing.repeat(reps)[:S]
+                padded_neighbors[idx] = tiled
+
+        # For keypoints with count >= S, subsample deterministically
+        needs_subsample = counts > S
+        if needs_subsample.any():
+            sub_indices = torch.nonzero(needs_subsample, as_tuple=False).flatten()
+            for idx in sub_indices.tolist():
+                c = int(counts[idx].item())
+                sel = torch.linspace(0, c - 1, S, dtype=torch.float32).round().long()
+                padded_neighbors[idx] = padded_neighbors[idx][sel]
+
+        # padded_neighbors is [K, S] with valid PCD indices
         pcd_desc = np.empty((K, self.dim), dtype=np.float32)
 
         # --- batching ---
@@ -278,55 +345,12 @@ class GeDi:
             i_start = b * self.samples_per_batch
             i_end = min((b + 1) * self.samples_per_batch, K)
 
-            x = np.empty(
-                (i_end - i_start, 3, self.samples_per_patch_lrf),
-                dtype=np.float32,
-            )
-
-            for j, i in enumerate(range(i_start, i_end)):
-                inds = neighbors[i]
-                inds_np = np.asarray(inds, dtype=np.int64)
-                pcd_size = int(len(pcd))
-
-                if inds_np.size == 0:
-                    # Extremely rare, but be safe.
-                    if pcd_size <= 0:
-                        raise ValueError(
-                            "Empty point cloud passed to GeDi.compute; "
-                            "cannot sample LRF neighborhoods."
-                        )
-                    if pcd_size >= self.samples_per_patch_lrf:
-                        inds_np = np.linspace(
-                            0,
-                            pcd_size - 1,
-                            self.samples_per_patch_lrf,
-                            dtype=np.int64,
-                        )
-                    else:
-                        reps = int(np.ceil(self.samples_per_patch_lrf / pcd_size))
-                        inds_np = np.tile(np.arange(pcd_size, dtype=np.int64), reps)[
-                            : self.samples_per_patch_lrf
-                        ]
-
-                elif inds_np.size >= self.samples_per_patch_lrf:
-                    sel = np.linspace(
-                        0,
-                        inds_np.size - 1,
-                        self.samples_per_patch_lrf,
-                        dtype=np.int64,
-                    )
-                    inds_np = inds_np[sel]
-                else:
-                    # Pad deterministically with repeats.
-                    reps = int(np.ceil(self.samples_per_patch_lrf / inds_np.size))
-                    inds_np = np.tile(inds_np, reps)[: self.samples_per_patch_lrf]
-
-                x[j] = pcd[inds_np].T.cpu().numpy()
-
-            x = torch.from_numpy(x).to(device=device, dtype=torch.float32)
+            # Gather all neighbor points for this batch in one operation
+            batch_inds = padded_neighbors[i_start:i_end]  # [B, S]
+            # pcd[batch_inds] -> [B, S, 3], transpose to [B, 3, S]
+            x = pcd[batch_inds].permute(0, 2, 1).contiguous()
 
             pts_batch = pts[i_start:i_end].to(device=x.device, dtype=torch.float32)
-            assert x.device == pts_batch.device
             patch = self.lrf(pts_batch, x)
 
             with torch.no_grad():
